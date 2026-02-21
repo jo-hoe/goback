@@ -253,46 +253,96 @@ func New(cfg Config, opts ...Option) (*Hook, error) {
 // When ExpectedStatus is provided, any status not in the list triggers retries up to MaxRetries
 // with Backoff delay between attempts; after exhausting retries, an error is returned.
 func (h *Hook) Execute(ctx context.Context, data any) (*http.Response, []byte, error) {
-	// Render method
+	// Prepare static parts once
+	method, err := h.renderMethod(data)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	u, err := h.renderURLWithQuery(data)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	headers, err := h.buildHeaders(data)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	renderedBody, err := h.renderBodyString(data)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var lastResp *http.Response
+	var lastBody []byte
+	var lastErr error
+
+	for attempt := 0; attempt <= h.cfg.MaxRetries; attempt++ {
+		resp, body, ok, err := h.doAttempt(ctx, method, u.String(), renderedBody, headers)
+		if ok {
+			return resp, body, nil
+		}
+		lastResp, lastBody, lastErr = resp, body, err
+
+		if attempt < h.cfg.MaxRetries {
+			if werr := h.waitBackoff(ctx); werr != nil {
+				return lastResp, lastBody, werr
+			}
+			continue
+		}
+		return lastResp, lastBody, lastErr
+	}
+
+	// Should be unreachable
+	return nil, nil, errors.New("hook: unexpected execution flow")
+}
+
+// renderMethod renders and validates the HTTP method.
+func (h *Hook) renderMethod(data any) (string, error) {
 	method, err := h.renderString(h.cfg.Method, data)
 	if err != nil {
-		return nil, nil, wrapErr("render method", err)
+		return "", wrapErr("render method", err)
 	}
 	method = strings.ToUpper(strings.TrimSpace(method))
 	if method == "" {
-		return nil, nil, errors.New("hook: rendered method empty")
+		return "", errors.New("hook: rendered method empty")
 	}
+	return method, nil
+}
 
-	// Render URL
+// renderURLWithQuery renders the URL and merges any configured query parameters.
+func (h *Hook) renderURLWithQuery(data any) (*url.URL, error) {
 	rawURL, err := h.renderString(h.cfg.URL, data)
 	if err != nil {
-		return nil, nil, wrapErr("render URL", err)
+		return nil, wrapErr("render URL", err)
 	}
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		return nil, nil, wrapErr("parse URL", err)
+		return nil, wrapErr("parse URL", err)
 	}
 
-	// Merge query params: from URL + from cfg.Query (templated)
 	q := u.Query()
 	if len(h.cfg.Query) > 0 {
 		renderedQ, err := h.renderStringMap(h.cfg.Query, data)
 		if err != nil {
-			return nil, nil, wrapErr("render query", err)
+			return nil, wrapErr("render query", err)
 		}
 		for k, v := range renderedQ {
-			// Support comma-separated multi-values? Keep it simple: Set.
 			q.Set(k, v)
 		}
 	}
 	u.RawQuery = q.Encode()
+	return u, nil
+}
 
-	// Render headers
+// buildHeaders renders configured headers and content type.
+func (h *Hook) buildHeaders(data any) (http.Header, error) {
 	headers := make(http.Header)
 	if len(h.cfg.Headers) > 0 {
 		renderedH, err := h.renderStringMap(h.cfg.Headers, data)
 		if err != nil {
-			return nil, nil, wrapErr("render headers", err)
+			return nil, wrapErr("render headers", err)
 		}
 		for k, v := range renderedH {
 			hk := http.CanonicalHeaderKey(strings.TrimSpace(k))
@@ -302,87 +352,90 @@ func (h *Hook) Execute(ctx context.Context, data any) (*http.Response, []byte, e
 		}
 	}
 
-	// Render content type (unless already set in headers)
 	if ct := strings.TrimSpace(h.cfg.ContentType); ct != "" && headers.Get("Content-Type") == "" {
 		rct, err := h.renderString(ct, data)
 		if err != nil {
-			return nil, nil, wrapErr("render content-type", err)
+			return nil, wrapErr("render content-type", err)
 		}
 		if strings.TrimSpace(rct) != "" {
 			headers.Set("Content-Type", rct)
 		}
 	}
+	return headers, nil
+}
 
-	// Render body once; reuse for each attempt
-	var renderedBody string
-	if strings.TrimSpace(h.cfg.Body) != "" {
-		rb, err := h.renderString(h.cfg.Body, data)
-		if err != nil {
-			return nil, nil, wrapErr("render body", err)
-		}
-		renderedBody = rb
+// renderBodyString renders the request body once for reuse across attempts.
+func (h *Hook) renderBodyString(data any) (string, error) {
+	if strings.TrimSpace(h.cfg.Body) == "" {
+		return "", nil
 	}
-
-	var lastResp *http.Response
-	var lastBody []byte
-	var lastErr error
-
-	max := h.cfg.MaxRetries
-	for attempt := 0; attempt <= max; attempt++ {
-		// Build request per attempt (new body reader each time)
-		var bodyReader io.Reader
-		if strings.TrimSpace(renderedBody) != "" {
-			bodyReader = strings.NewReader(renderedBody)
-		}
-		req, err := http.NewRequestWithContext(ctx, method, u.String(), bodyReader)
-		if err != nil {
-			return nil, nil, wrapErr("build request", err)
-		}
-		req.Header = headers
-
-		// Perform request
-		resp, err := h.client.Do(req)
-		if err != nil {
-			lastResp, lastBody, lastErr = nil, nil, wrapErr("do request", err)
-		} else {
-			// Read entire response body, then close original body and reset it so caller can read again.
-			respBody, rerr := io.ReadAll(resp.Body)
-			if rerr != nil {
-				lastResp, lastBody, lastErr = resp, nil, wrapErr("read response body", rerr)
-				_ = resp.Body.Close()
-			} else {
-				_ = resp.Body.Close()
-				resp.Body = io.NopCloser(bytes.NewReader(respBody))
-
-				// Check expected status codes policy
-				if h.isExpectedStatus(resp.StatusCode) {
-					return resp, respBody, nil
-				}
-				// Unexpected status code
-				lastResp, lastBody, lastErr = resp, respBody, fmt.Errorf("hook: unexpected status code %d", resp.StatusCode)
-			}
-		}
-
-		// If we have retries left, wait for backoff (if any) honoring context
-		if attempt < max {
-			if h.backoff > 0 {
-				t := time.NewTimer(h.backoff)
-				select {
-				case <-t.C:
-				case <-ctx.Done():
-					t.Stop()
-					return lastResp, lastBody, wrapErr("retry wait canceled", ctx.Err())
-				}
-			}
-			continue
-		}
-
-		// No more retries
-		return lastResp, lastBody, lastErr
+	rb, err := h.renderString(h.cfg.Body, data)
+	if err != nil {
+		return "", wrapErr("render body", err)
 	}
+	return rb, nil
+}
 
-	// Should be unreachable
-	return nil, nil, errors.New("hook: unexpected execution flow")
+// createRequest builds a new http.Request for a single attempt.
+func (h *Hook) createRequest(ctx context.Context, method, urlStr, body string, headers http.Header) (*http.Request, error) {
+	var bodyReader io.Reader
+	if strings.TrimSpace(body) != "" {
+		bodyReader = strings.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, urlStr, bodyReader)
+	if err != nil {
+		return nil, wrapErr("build request", err)
+	}
+	req.Header = headers
+	return req, nil
+}
+
+// readAndResetBody reads the response body and resets it so the caller can read again.
+func (h *Hook) readAndResetBody(resp *http.Response) ([]byte, error) {
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		_ = resp.Body.Close()
+		return nil, wrapErr("read response body", err)
+	}
+	_ = resp.Body.Close()
+	resp.Body = io.NopCloser(bytes.NewReader(respBody))
+	return respBody, nil
+}
+
+// waitBackoff waits for the configured backoff duration or context cancellation.
+func (h *Hook) waitBackoff(ctx context.Context) error {
+	if h.backoff <= 0 {
+		return nil
+	}
+	t := time.NewTimer(h.backoff)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return nil
+	case <-ctx.Done():
+		return wrapErr("retry wait canceled", ctx.Err())
+	}
+}
+
+// doAttempt performs a single HTTP attempt including reading and policy checking.
+// Returns resp, body, ok (true if status is expected), and error.
+func (h *Hook) doAttempt(ctx context.Context, method, urlStr, body string, headers http.Header) (*http.Response, []byte, bool, error) {
+	req, err := h.createRequest(ctx, method, urlStr, body, headers)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	resp, err := h.client.Do(req)
+	if err != nil {
+		return nil, nil, false, wrapErr("do request", err)
+	}
+	respBody, rerr := h.readAndResetBody(resp)
+	if rerr != nil {
+		return resp, nil, false, rerr
+	}
+	if h.isExpectedStatus(resp.StatusCode) {
+		return resp, respBody, true, nil
+	}
+	return resp, respBody, false, fmt.Errorf("hook: unexpected status code %d", resp.StatusCode)
 }
 
 // renderString renders a single template string with the provided data.
