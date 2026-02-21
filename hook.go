@@ -35,7 +35,7 @@ import (
 //		Query:           map[string]string{"q": "{{ .Query }}"},
 //		ContentType:     "application/json",
 //		Body:            `{"id":"{{ .ID }}","message":"{{ .Message | urlencode }}"}`,
-//		TimeoutSeconds:  10,
+//		Timeout:         "10s",
 //		StrictTemplates: true,
 //		ExpectedStatus:  []int{200, 201},
 //		MaxRetries:      3,
@@ -61,57 +61,58 @@ import (
 // which are resolved at Execute time against the provided data object.
 type Config struct {
 	// URL is the target endpoint. May include template placeholders.
-	URL string
+	URL string `yaml:"url"`
 
 	// Method is the HTTP method (GET, POST, PUT, PATCH, DELETE, ...).
 	// If empty, defaults to:
 	// - POST when Body is non-empty
 	// - GET otherwise
-	Method string
+	Method string `yaml:"method"`
 
 	// Headers are request headers. Values may contain templates.
 	// Keys are treated as-is, but may also contain templates.
-	Headers map[string]string
+	Headers map[string]string `yaml:"headers"`
 
 	// Query are query parameters to be added to the URL. Both keys and values
 	// may contain templates. These are merged with the URL's existing query.
-	Query map[string]string
+	Query map[string]string `yaml:"query"`
 
 	// Body is the request body as a string (after templating). Optional.
-	Body string
+	Body string `yaml:"body"`
 
 	// ContentType, if set and the "Content-Type" header is not already provided
 	// by Headers, will be applied to the request.
 	// May contain templates.
-	ContentType string
+	ContentType string `yaml:"contentType"`
 
-	// TimeoutSeconds applies to the HTTP client used by this Hook, unless a custom
-	// client is supplied via options. 0 means no explicit timeout (uses http.Client default).
-	TimeoutSeconds int
+	// Timeout applies to the HTTP client used by this Hook, unless a custom
+	// client is supplied via options. K8s-style duration string (e.g., "30s", "3m", "1h", "4d").
+	// Empty means no explicit timeout (uses http.Client default).
+	Timeout string `yaml:"timeout"`
 
 	// InsecureSkipVerify disables TLS certificate verification when true.
 	// Only applies to the default http.Client created by New.
-	InsecureSkipVerify bool
+	InsecureSkipVerify bool `yaml:"insecureSkipVerify"`
 
 	// StrictTemplates controls missing key behavior:
 	// - true: missing template variables cause an error (missingkey=error)
 	// - false: missing variables render as <no value> (missingkey=default)
-	StrictTemplates bool
+	StrictTemplates bool `yaml:"strictTemplates"`
 
 	// ExpectedStatus lists acceptable HTTP response status codes.
 	// When non-empty, any response code not in this list is considered unexpected
 	// and will trigger retries (up to MaxRetries). When empty, status codes do not
 	// affect success and are left to the caller to interpret.
-	ExpectedStatus []int
+	ExpectedStatus []int `yaml:"expectedStatus"`
 
 	// MaxRetries controls how many retry attempts to make on transport errors
 	// or unexpected status codes. 0 means no retries (single attempt).
-	MaxRetries int
+	MaxRetries int `yaml:"maxRetries"`
 
 	// Backoff is the delay between retries, parsed in a Kubernetes-style duration.
 	// Examples: "24s", "3m", "1h30m", "4d", "1w", or a combination like "3m 4d".
 	// When empty, no delay between attempts. Invalid values cause New to return an error.
-	Backoff string
+	Backoff string `yaml:"backoff"`
 }
 
 // Hook is a reusable executor for a webhook Config.
@@ -128,8 +129,8 @@ type Hook struct {
 // Option configures a Hook.
 type Option func(*Hook)
 
-// WithHTTPClient provides a custom http.Client. When provided, TimeoutSeconds
-// and InsecureSkipVerify from Config are not applied (the client is used as-is).
+/* WithHTTPClient provides a custom http.Client. When provided, Timeout
+and InsecureSkipVerify from Config are not applied (the client is used as-is). */
 func WithHTTPClient(c *http.Client) Option {
 	return func(h *Hook) {
 		if c != nil {
@@ -138,7 +139,7 @@ func WithHTTPClient(c *http.Client) Option {
 	}
 }
 
-// WithTimeout overrides Config.TimeoutSeconds using a time.Duration.
+/* WithTimeout overrides Config.Timeout using a time.Duration. */
 func WithTimeout(d time.Duration) Option {
 	return func(h *Hook) {
 		if h.client != nil {
@@ -225,8 +226,12 @@ func New(cfg Config, opts ...Option) (*Hook, error) {
 	// If no custom client provided, build a default one honoring cfg flags.
 	if h.client == nil {
 		timeout := time.Duration(0)
-		if cfg.TimeoutSeconds > 0 {
-			timeout = time.Duration(cfg.TimeoutSeconds) * time.Second
+		if s := strings.TrimSpace(cfg.Timeout); s != "" {
+			d, err := parseK8sDuration(s)
+			if err != nil {
+				return nil, wrapErr("parse timeout", err)
+			}
+			timeout = d
 		}
 		tr := cloneDefaultTransport()
 		if cfg.InsecureSkipVerify {
