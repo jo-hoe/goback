@@ -2,6 +2,7 @@ package gohook
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -137,5 +138,201 @@ func TestHookExecutor_Execute_StrictTemplatesMissingKeyErrors(t *testing.T) {
 	_, _, err = exec.Execute(context.Background(), TemplateData{Values: map[string]string{}})
 	if err == nil || !strings.Contains(err.Error(), "render URL") {
 		t.Fatalf("expected render URL error due to missing key, got %v", err)
+	}
+}
+
+// multipartRecorderServer records multipart/form-data requests for assertions.
+type multipartRecorderServer struct {
+	srv           *httptest.Server
+	lastRequest   *http.Request
+	lastFieldVals map[string]string
+	lastFileName  string
+	lastFileBytes []byte
+}
+
+func newMultipartRecorderServer(status int) *multipartRecorderServer {
+	m := &multipartRecorderServer{}
+	m.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		m.lastRequest = r
+
+		// Expect multipart
+		ct := r.Header.Get("Content-Type")
+		if !strings.HasPrefix(ct, "multipart/form-data; boundary=") {
+			w.WriteHeader(400)
+			_, _ = w.Write([]byte("expected multipart"))
+			return
+		}
+
+		// Parse form
+		if err := r.ParseMultipartForm(10 << 20); err != nil {
+			w.WriteHeader(400)
+			_, _ = w.Write([]byte("parse error: " + err.Error()))
+			return
+		}
+
+		m.lastFieldVals = make(map[string]string)
+		for k, vals := range r.MultipartForm.Value {
+			if len(vals) > 0 {
+				m.lastFieldVals[k] = vals[0]
+			}
+		}
+
+		// Expect one file under field "file"
+		if r.MultipartForm.File != nil {
+			if files := r.MultipartForm.File["file"]; len(files) > 0 {
+				fh := files[0]
+				m.lastFileName = fh.Filename
+				f, err := fh.Open()
+				if err == nil {
+					defer func() { _ = f.Close() }()
+					m.lastFileBytes, _ = io.ReadAll(f)
+				}
+			}
+		}
+
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	return m
+}
+
+func (m *multipartRecorderServer) Close()      { m.srv.Close() }
+func (m *multipartRecorderServer) URL() string { return m.srv.URL }
+
+func TestHook_ExecuteMultipart_InMemoryBytes(t *testing.T) {
+	rs := newMultipartRecorderServer(201)
+	defer rs.Close()
+
+	cfg := Config{
+		URL:            rs.URL() + "/upload?src={{ .Source }}",
+		Headers:        map[string]string{"Authorization": "Bearer {{ .Token }}"},
+		ExpectedStatus: []int{201},
+		Multipart: &Multipart{
+			Fields: map[string]string{
+				"title": "{{ .Title }}",
+				"note":  "{{ .Note }}",
+			},
+			Files: []ByteFile{
+				{
+					Field:       "file",
+					FileName:    "report-{{ .Quarter }}.pdf",
+					ContentType: "application/pdf",
+					Data:        []byte("%PDF-FAKE%"),
+				},
+			},
+		},
+	}
+	h, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New error: %v", err)
+	}
+
+	resp, body, err := h.Execute(context.Background(), map[string]any{
+		"Source":  "gohook",
+		"Token":   "abc123",
+		"Title":   "Report",
+		"Note":    "Please review",
+		"Quarter": "Q1",
+	})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if resp.StatusCode != 201 {
+		t.Fatalf("expected 201, got %d", resp.StatusCode)
+	}
+	if string(body) != "ok" {
+		t.Fatalf("expected body ok, got %q", string(body))
+	}
+
+	// Assertions on recorded request
+	if rs.lastRequest == nil {
+		t.Fatalf("no request recorded")
+	}
+	if rs.lastRequest.Method != http.MethodPost {
+		t.Fatalf("expected POST, got %s", rs.lastRequest.Method)
+	}
+	if rs.lastRequest.URL.Query().Get("src") != "gohook" {
+		t.Fatalf("expected query src=gohook")
+	}
+	if got := rs.lastRequest.Header.Get("Authorization"); got != "Bearer abc123" {
+		t.Fatalf("auth header mismatch: %q", got)
+	}
+
+	// Fields
+	if rs.lastFieldVals["title"] != "Report" {
+		t.Fatalf("field title mismatch: %q", rs.lastFieldVals["title"])
+	}
+	if rs.lastFieldVals["note"] != "Please review" {
+		t.Fatalf("field note mismatch: %q", rs.lastFieldVals["note"])
+	}
+
+	// File
+	if rs.lastFileName != "report-Q1.pdf" {
+		t.Fatalf("filename mismatch: %q", rs.lastFileName)
+	}
+	if string(rs.lastFileBytes) != "%PDF-FAKE%" {
+		t.Fatalf("file content mismatch: %q", string(rs.lastFileBytes))
+	}
+}
+
+func TestHookExecutor_ExecuteMultipart_Typed(t *testing.T) {
+	rs := newMultipartRecorderServer(200)
+	defer rs.Close()
+
+	cfg := Config{
+		URL:            rs.URL() + "/typed?src={{ .source }}",
+		Headers:        map[string]string{"X-Req": "{{ .reqid }}"},
+		ExpectedStatus: []int{200},
+		Multipart: &Multipart{
+			Fields: map[string]string{
+				"a": "{{ .a }}",
+				"b": "{{ .b }}",
+			},
+			Files: []ByteFile{
+				{Field: "file", FileName: "x.txt", Data: []byte("hello")},
+			},
+		},
+	}
+	exec, err := NewHookExecutor(cfg, nil)
+	if err != nil {
+		t.Fatalf("NewHookExecutor error: %v", err)
+	}
+
+	resp, body, err := exec.Execute(context.Background(), TemplateData{
+		Values: map[string]string{
+			"source": "typed",
+			"reqid":  "r123",
+			"a":      "1",
+			"b":      "2",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if resp.StatusCode != 200 {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	if string(body) != "ok" {
+		t.Fatalf("expected body ok, got %q", string(body))
+	}
+
+	// Assertions
+	if rs.lastRequest == nil {
+		t.Fatalf("no request recorded")
+	}
+	if rs.lastRequest.Method != http.MethodPost {
+		t.Fatalf("expected POST, got %s", rs.lastRequest.Method)
+	}
+	if rs.lastRequest.URL.Query().Get("src") != "typed" {
+		t.Fatalf("expected query src=typed")
+	}
+	if got := rs.lastRequest.Header.Get("X-Req"); got != "r123" {
+		t.Fatalf("header X-Req mismatch: %q", got)
+	}
+	if rs.lastFieldVals["a"] != "1" || rs.lastFieldVals["b"] != "2" {
+		t.Fatalf("field values mismatch: %+v", rs.lastFieldVals)
+	}
+	if rs.lastFileName != "x.txt" || string(rs.lastFileBytes) != "hello" {
+		t.Fatalf("file mismatch: name=%q bytes=%q", rs.lastFileName, string(rs.lastFileBytes))
 	}
 }

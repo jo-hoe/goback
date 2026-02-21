@@ -113,9 +113,91 @@ func main() {
 ```
 
 Notes:
+
 - TemplateData values are exposed to templates as {{ .<Key> }}.
 - Execute returns the underlying *http.Response and response body bytes, similar to Hook.Execute.
 - When a custom *http.Client is provided, Config.Timeout and Config.InsecureSkipVerify are ignored (the client is used as-is).
+
+## Multipart form-data (attachments via in-memory bytes)
+
+Use multipart/form-data to send regular form fields and file attachments from in-memory bytes by configuring Config.Multipart. Then call Execute as usual (either via Hook or HookExecutor). No separate ExecuteMultipart function is needed.
+
+### Types
+
+- Multipart:
+  - Fields: map[string]string — normal form fields (keys and values templated)
+  - Files: []ByteFile — in-memory file attachments
+- ByteFile:
+  - Field: string — form field name (templated)
+  - FileName: string — filename sent to server (templated; defaults to "file" when empty)
+  - ContentType: string — optional per-file content type (templated)
+  - Data: []byte — file content in memory
+
+### Behavior
+
+- Content-Type is set automatically with a generated boundary for multipart requests (overrides any Content-Type header for this request).
+- Method defaulting: if Config.Method is empty and either Body is non-empty or Multipart is set, the default method is POST; otherwise GET.
+- Templates: field names, field values, file field names, file names, and per-file content types support Go text/template placeholders and StrictTemplates behavior.
+
+#### Example (Hook)
+
+```go
+cfg := gohook.Config{
+  URL:            "https://example.com/upload?src={{ .Source }}",
+  Headers:        map[string]string{"Authorization": "Bearer {{ .Token }}"},
+  ExpectedStatus: []int{201},
+  Multipart: &gohook.Multipart{
+    Fields: map[string]string{
+      "title": "{{ .Title }}",
+      "note":  "{{ .Note }}",
+    },
+    Files: []gohook.ByteFile{
+      {
+        Field:       "file",
+        FileName:    "report-{{ .Quarter }}.pdf",
+        ContentType: "application/pdf",
+        Data:        []byte("%PDF-FAKE%"),
+      },
+    },
+  },
+}
+h, err := gohook.New(cfg)
+if err != nil {
+  panic(err)
+}
+resp, body, err := h.Execute(context.Background(), map[string]any{
+  "Source":  "gohook",
+  "Token":   "abc123",
+  "Title":   "Report",
+  "Note":    "Please review",
+  "Quarter": "Q1",
+})
+```
+
+#### Example (HookExecutor typed helper)
+
+```go
+exec, err := gohook.NewHookExecutor(gohook.Config{
+  URL:            "https://example.com/typed?src={{ .source }}",
+  Headers:        map[string]string{"X-Req": "{{ .reqid }}"},
+  ExpectedStatus: []int{200},
+  Multipart: &gohook.Multipart{
+    Fields: map[string]string{"a": "{{ .a }}", "b": "{{ .b }}"},
+    Files:  []gohook.ByteFile{{ Field: "file", FileName: "x.txt", Data: []byte("hello") }},
+  },
+}, nil)
+if err != nil {
+  panic(err)
+}
+resp, body, err := exec.Execute(context.Background(), gohook.TemplateData{
+  Values: map[string]string{"source": "typed", "reqid": "r123", "a": "1", "b": "2"},
+})
+```
+
+Caveat (memory buffering):
+
+- Multipart bodies are assembled entirely in memory before the request is sent. Very large files will increase memory usage accordingly. Streaming file parts is not currently supported.
+- If you need streaming for very large attachments, open an issue; the API can be extended to stream parts without buffering the full body.
 
 ## Configuration
 

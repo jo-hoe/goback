@@ -1,24 +1,7 @@
-package gohook
-
-import (
-	"bytes"
-	"context"
-	"crypto/tls"
-	"encoding/json"
-	"errors"
-	"fmt"
-	"io"
-	"net/http"
-	"net/url"
-	"strings"
-	"text/template"
-	"time"
-)
-
-//// Package gohook provides a small dependency-free library to execute configurable,
-//// template-driven HTTP webhooks.
+// // Package gohook provides a small dependency-free library to execute configurable,
+// // template-driven HTTP webhooks.
 //
-// Overview
+// # Overview
 //
 // - Configure an outbound HTTP request via Config (URL, method, headers, query, body).
 // - Use Go text/template placeholders (e.g. {{ .Var }}) in any string field.
@@ -29,32 +12,50 @@ import (
 // Example:
 //
 //	cfg := hook.Config{
-//		URL:             "https://api.example.com/items?src={{ .Source }}",
-//		Method:          "POST",
-//		Headers:         map[string]string{"Authorization": "Bearer {{ .Token }}"},
-//		Query:           map[string]string{"q": "{{ .Query }}"},
-//		ContentType:     "application/json",
-//		Body:            `{"id":"{{ .ID }}","message":"{{ .Message | urlencode }}"}`,
-//		Timeout:         "10s",
-//		StrictTemplates: true,
-//		ExpectedStatus:  []int{200, 201},
-//		MaxRetries:      3,
-//		Backoff:         "30s",
+//	    URL:             "https://api.example.com/items?src={{ .Source }}",
+//	    Method:          "POST",
+//	    Headers:         map[string]string{"Authorization": "Bearer {{ .Token }}"},
+//	    Query:           map[string]string{"q": "{{ .Query }}"},
+//	    ContentType:     "application/json",
+//	    Body:            `{"id":"{{ .ID }}","message":"{{ .Message | urlencode }}"}`,
+//	    Timeout:         "10s",
+//	    StrictTemplates: true,
+//	    ExpectedStatus:  []int{200, 201},
+//	    MaxRetries:      3,
+//	    Backoff:         "30s",
 //	}
 //	h, err := hook.New(cfg)
 //	if err != nil {
-//		panic(err)
+//	    panic(err)
 //	}
 //	resp, respBody, err := h.Execute(context.Background(), map[string]any{
-//		"Source":  "gohook",
-//		"Token":   "abc123",
-//		"Query":   "search term",
-//		"ID":      "42",
-//		"Message": "hello world",
+//	    "Source":  "gohook",
+//	    "Token":   "abc123",
+//	    "Query":   "search term",
+//	    "ID":      "42",
+//	    "Message": "hello world",
 //	})
 //	_ = resp
 //	_ = respBody
 //	_ = err
+package gohook
+
+import (
+	"bytes"
+	"context"
+	"crypto/tls"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"mime/multipart"
+	"net/http"
+	"net/textproto"
+	"net/url"
+	"strings"
+	"text/template"
+	"time"
+)
 
 // Config defines a single webhook execution plan.
 // All string fields support Go text/template placeholders ({{ ... }}),
@@ -79,6 +80,12 @@ type Config struct {
 
 	// Body is the request body as a string (after templating). Optional.
 	Body string `yaml:"body"`
+
+	// Multipart defines a multipart/form-data body with in-memory file data.
+	// When set, Body is ignored and Content-Type is set automatically with boundary.
+	// Field names, field values, file field names, filenames, and per-file content types
+	// may contain templates.
+	Multipart *Multipart `yaml:"multipart"`
 
 	// ContentType, if set and the "Content-Type" header is not already provided
 	// by Headers, will be applied to the request.
@@ -115,6 +122,25 @@ type Config struct {
 	Backoff string `yaml:"backoff"`
 }
 
+// ByteFile represents an in-memory file part for multipart/form-data requests.
+type ByteFile struct {
+	// Field is the form field name for this file part (templated).
+	Field string `yaml:"field"`
+	// FileName is the filename to present to the server (templated; optional, defaults to "file").
+	FileName string `yaml:"fileName"`
+	// ContentType is an optional per-file content type (templated). If empty, defaults per mime/multipart to application/octet-stream.
+	ContentType string `yaml:"contentType"`
+	// Data holds the raw file content in memory.
+	Data []byte `yaml:"-"`
+}
+
+// Multipart carries form fields and in-memory files to send.
+// Field names, values, filenames, and content types support templates.
+type Multipart struct {
+	Fields map[string]string `yaml:"fields"`
+	Files  []ByteFile        `yaml:"files"`
+}
+
 // Hook is a reusable executor for a webhook Config.
 //
 // Hook is safe for concurrent use if the provided http.Client is safe for concurrent use
@@ -129,8 +155,8 @@ type Hook struct {
 // Option configures a Hook.
 type Option func(*Hook)
 
-/* WithHTTPClient provides a custom http.Client. When provided, Timeout
-and InsecureSkipVerify from Config are not applied (the client is used as-is). */
+// WithHTTPClient provides a custom http.Client. When provided, Timeout
+// and InsecureSkipVerify from Config are not applied (the client is used as-is).
 func WithHTTPClient(c *http.Client) Option {
 	return func(h *Hook) {
 		if c != nil {
@@ -196,7 +222,7 @@ func New(cfg Config, opts ...Option) (*Hook, error) {
 	// Choose default method if unset
 	method := strings.TrimSpace(cfg.Method)
 	if method == "" {
-		if strings.TrimSpace(cfg.Body) != "" {
+		if strings.TrimSpace(cfg.Body) != "" || cfg.Multipart != nil {
 			method = http.MethodPost
 		} else {
 			method = http.MethodGet
@@ -274,33 +300,36 @@ func (h *Hook) Execute(ctx context.Context, data any) (*http.Response, []byte, e
 		return nil, nil, err
 	}
 
+	// If multipart is configured, build multipart body and use a per-attempt reader factory.
+	if h.cfg.Multipart != nil {
+		bodyBytes, contentType, err := h.buildMultipartBody(data, h.cfg.Multipart)
+		if err != nil {
+			return nil, nil, err
+		}
+		// Always set the multipart Content-Type with boundary for this request.
+		headers.Set("Content-Type", contentType)
+
+		bodyFactory := func() io.Reader {
+			if len(bodyBytes) == 0 {
+				return nil
+			}
+			return bytes.NewReader(bodyBytes)
+		}
+		return h.executeWithBodyFactory(ctx, method, u.String(), headers, bodyFactory)
+	}
+
+	// Otherwise, render string body and use a per-attempt reader factory.
 	renderedBody, err := h.renderBodyString(data)
 	if err != nil {
 		return nil, nil, err
 	}
-
-	var lastResp *http.Response
-	var lastBody []byte
-	var lastErr error
-
-	for attempt := 0; attempt <= h.cfg.MaxRetries; attempt++ {
-		resp, body, ok, err := h.doAttempt(ctx, method, u.String(), renderedBody, headers)
-		if ok {
-			return resp, body, nil
+	bodyFactory := func() io.Reader {
+		if strings.TrimSpace(renderedBody) == "" {
+			return nil
 		}
-		lastResp, lastBody, lastErr = resp, body, err
-
-		if attempt < h.cfg.MaxRetries {
-			if werr := h.waitBackoff(ctx); werr != nil {
-				return lastResp, lastBody, werr
-			}
-			continue
-		}
-		return lastResp, lastBody, lastErr
+		return strings.NewReader(renderedBody)
 	}
-
-	// Should be unreachable
-	return nil, nil, errors.New("hook: unexpected execution flow")
+	return h.executeWithBodyFactory(ctx, method, u.String(), headers, bodyFactory)
 }
 
 // renderMethod renders and validates the HTTP method.
@@ -381,20 +410,6 @@ func (h *Hook) renderBodyString(data any) (string, error) {
 	return rb, nil
 }
 
-// createRequest builds a new http.Request for a single attempt.
-func (h *Hook) createRequest(ctx context.Context, method, urlStr, body string, headers http.Header) (*http.Request, error) {
-	var bodyReader io.Reader
-	if strings.TrimSpace(body) != "" {
-		bodyReader = strings.NewReader(body)
-	}
-	req, err := http.NewRequestWithContext(ctx, method, urlStr, bodyReader)
-	if err != nil {
-		return nil, wrapErr("build request", err)
-	}
-	req.Header = headers
-	return req, nil
-}
-
 // readAndResetBody reads the response body and resets it so the caller can read again.
 func (h *Hook) readAndResetBody(resp *http.Response) ([]byte, error) {
 	respBody, err := io.ReadAll(resp.Body)
@@ -422,25 +437,42 @@ func (h *Hook) waitBackoff(ctx context.Context) error {
 	}
 }
 
-// doAttempt performs a single HTTP attempt including reading and policy checking.
-// Returns resp, body, ok (true if status is expected), and error.
-func (h *Hook) doAttempt(ctx context.Context, method, urlStr, body string, headers http.Header) (*http.Response, []byte, bool, error) {
-	req, err := h.createRequest(ctx, method, urlStr, body, headers)
-	if err != nil {
-		return nil, nil, false, err
+// executeWithBodyFactory performs attempts with retries using a body factory to create a fresh reader per attempt.
+func (h *Hook) executeWithBodyFactory(ctx context.Context, method, urlStr string, headers http.Header, bodyFactory func() io.Reader) (*http.Response, []byte, error) {
+	var lastResp *http.Response
+	var lastBody []byte
+	var lastErr error
+
+	for attempt := 0; attempt <= h.cfg.MaxRetries; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, method, urlStr, bodyFactory())
+		if err != nil {
+			// Building a request failed; treat as fatal for this call.
+			return nil, nil, wrapErr("build request", err)
+		}
+		req.Header = headers
+
+		resp, err := h.client.Do(req)
+		if err != nil {
+			lastResp, lastBody, lastErr = nil, nil, wrapErr("do request", err)
+		} else {
+			respBody, rerr := h.readAndResetBody(resp)
+			if rerr != nil {
+				lastResp, lastBody, lastErr = resp, nil, rerr
+			} else if h.isExpectedStatus(resp.StatusCode) {
+				return resp, respBody, nil
+			} else {
+				lastResp, lastBody, lastErr = resp, respBody, fmt.Errorf("hook: unexpected status code %d", resp.StatusCode)
+			}
+		}
+
+		if attempt < h.cfg.MaxRetries {
+			if werr := h.waitBackoff(ctx); werr != nil {
+				return lastResp, lastBody, werr
+			}
+		}
 	}
-	resp, err := h.client.Do(req)
-	if err != nil {
-		return nil, nil, false, wrapErr("do request", err)
-	}
-	respBody, rerr := h.readAndResetBody(resp)
-	if rerr != nil {
-		return resp, nil, false, rerr
-	}
-	if h.isExpectedStatus(resp.StatusCode) {
-		return resp, respBody, true, nil
-	}
-	return resp, respBody, false, fmt.Errorf("hook: unexpected status code %d", resp.StatusCode)
+
+	return lastResp, lastBody, lastErr
 }
 
 // renderString renders a single template string with the provided data.
@@ -527,6 +559,90 @@ func (h *Hook) isExpectedStatus(code int) bool {
 		}
 	}
 	return false
+}
+
+// buildMultipartBody builds and renders a multipart/form-data request using in-memory file data.
+// It renders templated entries and assembles the multipart body in memory.
+func (h *Hook) buildMultipartBody(data any, mp *Multipart) ([]byte, string, error) {
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+
+	// Fields
+	if len(mp.Fields) > 0 {
+		rendered, err := h.renderStringMap(mp.Fields, data)
+		if err != nil {
+			_ = w.Close()
+			return nil, "", wrapErr("render multipart fields", err)
+		}
+		for k, v := range rendered {
+			if err := w.WriteField(strings.TrimSpace(k), v); err != nil {
+				_ = w.Close()
+				return nil, "", wrapErr("write multipart field", err)
+			}
+		}
+	}
+
+	// Files
+	for i := range mp.Files {
+		f := mp.Files[i]
+
+		field, err := h.renderString(f.Field, data)
+		if err != nil {
+			_ = w.Close()
+			return nil, "", wrapErr("render file field", err)
+		}
+		field = strings.TrimSpace(field)
+		if field == "" {
+			_ = w.Close()
+			return nil, "", errors.New("hook: multipart file field empty after rendering")
+		}
+
+		filename := strings.TrimSpace(f.FileName)
+		if filename == "" {
+			filename = "file"
+		}
+		filename, err = h.renderString(filename, data)
+		if err != nil {
+			_ = w.Close()
+			return nil, "", wrapErr("render file filename", err)
+		}
+
+		ct := strings.TrimSpace(f.ContentType)
+		if ct != "" {
+			ct, err = h.renderString(ct, data)
+			if err != nil {
+				_ = w.Close()
+				return nil, "", wrapErr("render file content-type", err)
+			}
+			hdr := make(textproto.MIMEHeader)
+			hdr.Set("Content-Disposition", fmt.Sprintf(`form-data; name="%s"; filename="%s"`, field, filename))
+			hdr.Set("Content-Type", ct)
+			part, err := w.CreatePart(hdr)
+			if err != nil {
+				_ = w.Close()
+				return nil, "", wrapErr("create multipart part", err)
+			}
+			if _, err := part.Write(f.Data); err != nil {
+				_ = w.Close()
+				return nil, "", wrapErr("write multipart bytes", err)
+			}
+		} else {
+			part, err := w.CreateFormFile(field, filename)
+			if err != nil {
+				_ = w.Close()
+				return nil, "", wrapErr("create multipart file", err)
+			}
+			if _, err := part.Write(f.Data); err != nil {
+				_ = w.Close()
+				return nil, "", wrapErr("write multipart bytes", err)
+			}
+		}
+	}
+
+	if err := w.Close(); err != nil {
+		return nil, "", wrapErr("finalize multipart body", err)
+	}
+	return buf.Bytes(), w.FormDataContentType(), nil
 }
 
 // parseK8sDuration parses a duration string similar to Go's time.ParseDuration,

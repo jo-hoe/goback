@@ -13,6 +13,9 @@ type TemplateData struct {
 
 // HookExecutor defines a simple, strongly-typed interface to execute a webhook
 // using gohook under the hood.
+// To send multipart/form-data with in-memory attachments, set Config.Multipart
+// when constructing the HookExecutor via NewHookExecutor, then call Execute.
+// Hook will detect Config.Multipart and build the multipart body automatically.
 type HookExecutor interface {
 	// Execute evaluates templates against the provided data and performs the HTTP request.
 	// It returns the underlying http.Response (if any), the response body bytes, and an error if execution fails.
@@ -25,7 +28,7 @@ type hookExecutor struct {
 
 // NewHookExecutor constructs a HookExecutor from a Config.
 // If client is non-nil, it will be used via WithHTTPClient; otherwise gohook will create its own client
-// using TimeoutSeconds and InsecureSkipVerify from the config.
+// honoring Timeout and InsecureSkipVerify from the config.
 func NewHookExecutor(cfg Config, client *http.Client) (HookExecutor, error) {
 	var (
 		h   *Hook
