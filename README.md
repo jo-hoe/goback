@@ -20,11 +20,11 @@ import (
  "context"
  "fmt"
 
- "github.com/jo-hoe/gohook/hook"
+ "github.com/jo-hoe/gohook"
 )
 
 func main() {
- cfg := hook.Config{
+ cfg := gohook.Config{
   URL:             "https://api.example.com/items?src={{ .Source }}",
   Method:          "POST",
   Headers:         map[string]string{"Authorization": "Bearer {{ .Token }}"},
@@ -38,7 +38,7 @@ func main() {
   Backoff:         "30s",
  }
 
- h, err := hook.New(cfg)
+ h, err := gohook.New(cfg)
  if err != nil {
   panic(err)
  }

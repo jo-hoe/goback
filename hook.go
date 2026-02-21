@@ -1,4 +1,4 @@
-package hook
+package gohook
 
 import (
 	"bytes"
@@ -15,8 +15,8 @@ import (
 	"time"
 )
 
-// Package hook provides a small dependency-free library to execute configurable,
-// template-driven HTTP webhooks.
+//// Package gohook provides a small dependency-free library to execute configurable,
+//// template-driven HTTP webhooks.
 //
 // Overview
 //
