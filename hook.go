@@ -547,6 +547,49 @@ func (h *Callback) funcs() template.FuncMap {
 	}
 }
 
+func buildFormDataContentDisposition(name, filename string) string {
+	// Sanitize parameters to prevent header injection and ensure valid quoted-string
+	safeName := sanitizeHeaderParam(name)
+	safeFilename := sanitizeHeaderParam(filename)
+
+	// ASCII fallback for quoted filename parameter
+	quotedFilename := asciiFallback(safeFilename)
+
+	// RFC 5987 filename* with UTF-8 percent-encoding
+	enc := rfc5987Encode(filename)
+
+	// Include both quoted filename (ASCII-safe fallback) and filename* (UTF-8)
+	return fmt.Sprintf(`form-data; name="%s"; filename="%s"; filename*=UTF-8''%s`, safeName, quotedFilename, enc)
+}
+
+func sanitizeHeaderParam(s string) string {
+	// Remove CR/LF to prevent header injection
+	s = strings.ReplaceAll(s, "\r", "")
+	s = strings.ReplaceAll(s, "\n", "")
+	// Escape backslash and double-quote for quoted-string
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `"`, `\"`)
+	return s
+}
+
+func asciiFallback(s string) string {
+	// Replace non-ASCII runes with '?'
+	var b strings.Builder
+	for _, r := range s {
+		if r > 0x7F {
+			b.WriteRune('?')
+		} else {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func rfc5987Encode(s string) string {
+	// Percent-encode UTF-8 bytes; spaces encoded as %20 (not '+')
+	return url.PathEscape(s)
+}
+
 // isExpectedStatus returns true if the given HTTP status code is acceptable
 // under this Callback's configuration.
 func (h *Callback) isExpectedStatus(code int) bool {
@@ -586,6 +629,7 @@ func (h *Callback) buildMultipartBody(data any, mp *Multipart) ([]byte, string, 
 	for i := range mp.Files {
 		f := mp.Files[i]
 
+		// Render field name
 		field, err := h.renderString(f.Field, data)
 		if err != nil {
 			_ = w.Close()
@@ -597,6 +641,7 @@ func (h *Callback) buildMultipartBody(data any, mp *Multipart) ([]byte, string, 
 			return nil, "", errors.New("callback: multipart file field empty after rendering")
 		}
 
+		// Render filename (default "file")
 		filename := strings.TrimSpace(f.FileName)
 		if filename == "" {
 			filename = "file"
@@ -607,6 +652,10 @@ func (h *Callback) buildMultipartBody(data any, mp *Multipart) ([]byte, string, 
 			return nil, "", wrapErr("render file filename", err)
 		}
 
+		// Build Content-Disposition with RFC 5987 filename* (UTF-8) and safe quoted fallback
+		cd := buildFormDataContentDisposition(field, filename)
+
+		// Resolve/assign content type (default application/octet-stream)
 		ct := strings.TrimSpace(f.ContentType)
 		if ct != "" {
 			ct, err = h.renderString(ct, data)
@@ -614,28 +663,22 @@ func (h *Callback) buildMultipartBody(data any, mp *Multipart) ([]byte, string, 
 				_ = w.Close()
 				return nil, "", wrapErr("render file content-type", err)
 			}
-			hdr := make(textproto.MIMEHeader)
-			hdr.Set("Content-Disposition", fmt.Sprintf(`form-data; name="%s"; filename="%s"`, field, filename))
-			hdr.Set("Content-Type", ct)
-			part, err := w.CreatePart(hdr)
-			if err != nil {
-				_ = w.Close()
-				return nil, "", wrapErr("create multipart part", err)
-			}
-			if _, err := part.Write(f.Data); err != nil {
-				_ = w.Close()
-				return nil, "", wrapErr("write multipart bytes", err)
-			}
 		} else {
-			part, err := w.CreateFormFile(field, filename)
-			if err != nil {
-				_ = w.Close()
-				return nil, "", wrapErr("create multipart file", err)
-			}
-			if _, err := part.Write(f.Data); err != nil {
-				_ = w.Close()
-				return nil, "", wrapErr("write multipart bytes", err)
-			}
+			ct = "application/octet-stream"
+		}
+
+		hdr := make(textproto.MIMEHeader)
+		hdr.Set("Content-Disposition", cd)
+		hdr.Set("Content-Type", ct)
+
+		part, err := w.CreatePart(hdr)
+		if err != nil {
+			_ = w.Close()
+			return nil, "", wrapErr("create multipart part", err)
+		}
+		if _, err := part.Write(f.Data); err != nil {
+			_ = w.Close()
+			return nil, "", wrapErr("write multipart bytes", err)
 		}
 	}
 

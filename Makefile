@@ -15,7 +15,7 @@ test:
 	
 # Run formatting and vet checks
 lint: vet
-	golangci-lint run -E gocyclo
+	golangci-lint run -E gocyclo -E misspell
 
 update:
 	git pull
