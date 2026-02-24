@@ -1,4 +1,4 @@
-.PHONY: lint fmt vet test
+.PHONY: lint fmt vet test update
 
 # Format code (fixes style issues)
 fmt:
@@ -16,3 +16,7 @@ test:
 # Run formatting and vet checks
 lint: vet
 	golangci-lint run -E gocyclo
+
+update:
+	git pull
+	go mod tidy
